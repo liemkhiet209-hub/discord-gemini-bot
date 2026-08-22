@@ -5,11 +5,12 @@ import discord
 from discord.ext import commands
 from google import genai
 
-# Lấy thông tin xác thực từ Environment Variables
+# Cấu hình từ biến môi trường
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TARGET_CHANNEL = "hỏi-đáp-gemini"
 
-# Web server mini giữ kết nối cho Render
+# Web server duy trì kết nối cho Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -27,7 +28,7 @@ def run_web():
 
 threading.Thread(target=run_web, daemon=True).start()
 
-# Cấu hình Intents
+# Thiết lập Discord Bot và Gemini AI
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -37,41 +38,43 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"--> Bot đã online thành công với tên: {bot.user}")
+    print(f"--> Bot đã online thành công: {bot.user}")
 
-# Tự động chào khi có bài đăng / luồng mới được tạo
+# Tự động chào khi tạo bài đăng mới trong hỏi-đáp-gemini
 @bot.event
 async def on_thread_create(thread):
     try:
-        # Lấy ID của người tạo bài đăng
-        owner_id = thread.owner_id
-        mention_str = f"<@{owner_id}>" if owner_id else "bạn"
-        
-        await thread.send(f"Xin chào {mention_str}! Bạn có cần giúp đỡ gì không? Hãy nhập câu hỏi chi tiết bên dưới nhé!")
-        print(f"--> Đã gửi lời chào trong bài đăng: {thread.name}")
+        parent_name = getattr(thread.parent, "name", "").lower()
+        if parent_name == TARGET_CHANNEL.lower() or "hỏi-đáp" in parent_name or "gemini" in parent_name:
+            owner_id = thread.owner_id
+            mention_str = f"<@{owner_id}>" if owner_id else "bạn"
+            await thread.send(f"Xin chào {mention_str}! Bạn có cần giúp đỡ gì không? Hãy đặt câu hỏi chi tiết bên dưới nhé!")
+            print(f"--> Đã gửi lời chào trong bài đăng: {thread.name}")
     except Exception as e:
         print(f"Lỗi khi gửi lời chào tạo bài đăng: {e}")
 
-# Tự động trả lời tin nhắn
+# Tự động đọc và trả lời câu hỏi
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    # Lấy tên kênh và tên kênh cha (nếu là bài đăng trong diễn đàn)
+    # Lấy thông tin kênh hiện tại và kênh diễn đàn cha (nếu là bài đăng)
     channel_name = getattr(message.channel, "name", "").lower()
     parent_name = ""
     if isinstance(message.channel, discord.Thread) and message.channel.parent:
         parent_name = message.channel.parent.name.lower()
 
-    # Kiểm tra điều kiện: tag bot, hoặc chat trong kênh/bài đăng hỏi đáp
-    is_mentioned = bot.user in message.mentions
-    is_in_qa = (
-        "hoi" in channel_name or "hỏi" in channel_name or
-        "hoi" in parent_name or "hỏi" in parent_name
+    # Điều kiện kích hoạt: nằm trong kênh/bài đăng hỏi-đáp-gemini hoặc được tag tên
+    is_in_target = (
+        channel_name == TARGET_CHANNEL.lower()
+        or parent_name == TARGET_CHANNEL.lower()
+        or "hỏi-đáp-gemini" in channel_name
+        or "hỏi-đáp-gemini" in parent_name
     )
+    is_mentioned = bot.user in message.mentions
 
-    if is_mentioned or is_in_qa:
+    if is_in_target or is_mentioned:
         prompt = message.content.replace(f"<@{bot.user.id}>", "").strip()
 
         if not prompt:
@@ -85,6 +88,7 @@ async def on_message(message):
                 )
                 answer = response.text
 
+                # Xử lý giới hạn 2000 ký tự của Discord
                 if len(answer) <= 2000:
                     await message.reply(answer)
                 else:
