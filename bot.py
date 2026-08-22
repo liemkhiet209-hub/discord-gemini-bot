@@ -1,7 +1,8 @@
-import os
+    import os
 import io
 import re
 import time
+import base64
 import random
 import asyncio
 import threading
@@ -14,7 +15,7 @@ from google import genai
 from openai import AsyncOpenAI
 from PIL import Image
 
-# 1. Cấu hình biến môi trường
+# 1. Biến môi trường
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GROQ_KEYS = [k.strip() for k in os.environ.get("GROQ_API_KEY", "").split(",") if k.strip()]
 GEMINI_KEYS = [k.strip() for k in os.environ.get("GEMINI_API_KEY", "").split(",") if k.strip()]
@@ -23,7 +24,7 @@ OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 TARGET_CHANNEL = "hỏi-đáp-gemini"
 USER_COOLDOWN = 3
 
-# Bộ nhớ hội thoại (8 tin nhắn gần nhất mỗi kênh)
+# Bộ nhớ ngữ cảnh (lưu 8 tin nhắn gần nhất mỗi kênh/thread)
 conversation_history = defaultdict(list)
 user_last_time = defaultdict(float)
 
@@ -51,27 +52,19 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# 4. Tự động lấy danh sách Model Groq ĐANG HOẠT ĐỘNG
-async def get_working_groq_model(client: AsyncGroq) -> str:
-    try:
-        models = await client.models.list()
-        active_ids = [m.id for m in models.data if "whisper" not in m.id and "guard" not in m.id]
-        for pref in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
-            if pref in active_ids:
-                return pref
-        if active_ids:
-            return active_ids[0]
-    except Exception:
-        pass
-    return "llama-3.1-8b-instant"
+# Danh sách CHỈ các model Groq chuẩn, miễn phí và hoạt động 100%
+STABLE_GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant"
+]
 
-# 5. Xử lý câu hỏi văn bản qua Groq Pool
+# 4. Xử lý câu hỏi văn bản qua Groq Pool
 async def ask_groq_text(channel_id: int, prompt: str) -> str:
     if not GROQ_KEYS:
         raise ValueError("Chưa cấu hình biến GROQ_API_KEY trên Render!")
 
     messages = [
-        {"role": "system", "content": "Bạn là trợ lý AI thông minh, hỗ trợ nhiệt tình. Hãy trả lời ngắn gọn, tự nhiên, đúng trọng tâm bằng tiếng Việt."}
+        {"role": "system", "content": "Bạn là trợ lý AI thông minh, nhiệt tình. Hãy trả lời ngắn gọn, tự nhiên, đúng trọng tâm bằng tiếng Việt."}
     ]
     messages.extend(conversation_history[channel_id])
     messages.append({"role": "user", "content": prompt})
@@ -81,28 +74,28 @@ async def ask_groq_text(channel_id: int, prompt: str) -> str:
     last_err = None
 
     for key in keys:
-        try:
-            client = AsyncGroq(api_key=key)
-            model_name = await get_working_groq_model(client)
-            chat_completion = await client.chat.completions.create(
-                messages=messages,
-                model=model_name,
-            )
-            raw = chat_completion.choices[0].message.content
-            answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip() or raw
+        client = AsyncGroq(api_key=key)
+        for model_name in STABLE_GROQ_MODELS:
+            try:
+                chat_completion = await client.chat.completions.create(
+                    messages=messages,
+                    model=model_name,
+                )
+                raw = chat_completion.choices[0].message.content
+                answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip() or raw
 
-            conversation_history[channel_id].append({"role": "user", "content": prompt})
-            conversation_history[channel_id].append({"role": "assistant", "content": answer})
-            if len(conversation_history[channel_id]) > 8:
-                conversation_history[channel_id] = conversation_history[channel_id][-8:]
+                conversation_history[channel_id].append({"role": "user", "content": prompt})
+                conversation_history[channel_id].append({"role": "assistant", "content": answer})
+                if len(conversation_history[channel_id]) > 8:
+                    conversation_history[channel_id] = conversation_history[channel_id][-8:]
 
-            return answer
-        except Exception as e:
-            last_err = e
-            continue
+                return answer
+            except Exception as e:
+                last_err = e
+                continue
     raise last_err
 
-# 6. Xử lý đọc hình ảnh qua Gemini (Dự phòng sang OpenRouter nếu Gemini hết lượt 429)
+# 5. Xử lý đọc hình ảnh (Gemini -> OpenRouter dự phòng)
 async def ask_vision_multiprovider(channel_id: int, image_bytes: bytes, mime_type: str, prompt: str) -> str:
     text_prompt = prompt if prompt else "Hãy phân tích và đọc chi tiết nội dung trong hình ảnh này."
     pil_img = Image.open(io.BytesIO(image_bytes))
@@ -124,13 +117,11 @@ async def ask_vision_multiprovider(channel_id: int, image_bytes: bytes, mime_typ
                     conversation_history[channel_id] = conversation_history[channel_id][-8:]
                 return answer
         except Exception as e:
-            print(f"Gemini Key lỗi/hết hạn mức: {e}")
             continue
 
-    # Nếu tất cả key Gemini đều hết lượt (429), chuyển sang OpenRouter Vision
+    # Dự phòng sang OpenRouter nếu Gemini hết lượt (429)
     if OPENROUTER_KEY:
         try:
-            import base64
             b64_img = base64.b64encode(image_bytes).decode("utf-8")
             or_client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_KEY)
             res = await or_client.chat.completions.create(
@@ -149,13 +140,13 @@ async def ask_vision_multiprovider(channel_id: int, image_bytes: bytes, mime_typ
                 conversation_history[channel_id].append({"role": "assistant", "content": answer})
                 return answer
         except Exception as e:
-            print(f"OpenRouter lỗi: {e}")
+            pass
 
-    raise ValueError("Tất cả các API Key đọc ảnh đều đã hết lượt hôm nay!")
+    raise ValueError("Hệ thống đọc ảnh hiện đang quá tải lượt gọi, vui lòng thử lại sau!")
 
 @bot.event
 async def on_ready():
-    print(f"--> Bot đã online sẵn sàng: {bot.user}")
+    print(f"--> Bot đã sẵn sàng: {bot.user}")
 
 @bot.event
 async def on_thread_create(thread):
