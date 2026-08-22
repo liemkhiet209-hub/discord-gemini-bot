@@ -1,4 +1,5 @@
 import os
+import time
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import discord
@@ -36,6 +37,27 @@ intents.guilds = True
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Hàm gọi Gemini AI có cơ chế tự động thử lại khi máy chủ quá tải
+def generate_ai_response(prompt: str) -> str:
+    models_to_try = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+    last_error = None
+
+    for model_name in models_to_try:
+        for attempt in range(2):
+            try:
+                response = ai_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+                if response and response.text:
+                    return response.text
+            except Exception as e:
+                last_error = e
+                time.sleep(1)  # Đợi 1 giây rồi thử lại
+                continue
+
+    raise last_error
+
 @bot.event
 async def on_ready():
     print(f"--> Bot đã online thành công: {bot.user}")
@@ -59,13 +81,11 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Lấy thông tin kênh hiện tại và kênh diễn đàn cha (nếu là bài đăng)
     channel_name = getattr(message.channel, "name", "").lower()
     parent_name = ""
     if isinstance(message.channel, discord.Thread) and message.channel.parent:
         parent_name = message.channel.parent.name.lower()
 
-    # Điều kiện kích hoạt: nằm trong kênh/bài đăng hỏi-đáp-gemini hoặc được tag tên
     is_in_target = (
         channel_name == TARGET_CHANNEL.lower()
         or parent_name == TARGET_CHANNEL.lower()
@@ -82,20 +102,15 @@ async def on_message(message):
 
         async with message.channel.typing():
             try:
-                response = ai_client.models.generate_content(
-                    model="gemini-3.6-flash",
-                    contents=prompt
-                )
-                answer = response.text
+                answer = generate_ai_response(prompt)
 
-                # Xử lý giới hạn 2000 ký tự của Discord
                 if len(answer) <= 2000:
                     await message.reply(answer)
                 else:
                     for chunk in [answer[i:i+1900] for i in range(0, len(answer), 1900)]:
                         await message.channel.send(chunk)
-            except Exception as e:
-                await message.reply(f"Đã xảy ra lỗi khi tạo phản hồi: {e}")
+            except Exception:
+                await message.reply("Hệ thống AI hiện đang quá tải lượt yêu cầu, bạn vui lòng đợi vài giây và thử gửi lại câu hỏi nhé!")
 
     await bot.process_commands(message)
 
