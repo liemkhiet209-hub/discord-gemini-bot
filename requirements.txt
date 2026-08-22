@@ -1,2 +1,4 @@
 discord.py
-openai
+groq
+google-genai
+pillow
