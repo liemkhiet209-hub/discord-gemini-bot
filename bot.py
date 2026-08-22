@@ -1,5 +1,6 @@
 import os
 import re
+import base64
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import discord
@@ -11,7 +12,7 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TARGET_CHANNEL = "hỏi-đáp-gemini"
 
-# Web server mini giữ bot luôn hoạt động trên Render
+# Web server duy trì kết nối cho Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -41,39 +42,9 @@ groq_client = None
 if GROQ_API_KEY:
     groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
-cached_model = None
-
-async def get_best_model():
-    global cached_model
-    if cached_model:
-        return cached_model
-
-    try:
-        models_data = await groq_client.models.list()
-        available_models = [
-            m.id for m in models_data.data 
-            if "whisper" not in m.id and "guard" not in m.id and "vision" not in m.id
-        ]
-        
-        for preference in ["llama-3.3", "llama-3.1", "llama3", "gemma2", "deepseek", "qwen"]:
-            for m in available_models:
-                if preference in m:
-                    cached_model = m
-                    return cached_model
-                    
-        if available_models:
-            cached_model = available_models[0]
-            return cached_model
-    except Exception as e:
-        print(f"Lỗi danh sách model: {e}")
-
-    return "llama-3.1-8b-instant"
-
 @bot.event
 async def on_ready():
     print(f"--> Bot đã online sẵn sàng: {bot.user}")
-    if groq_client:
-        await get_best_model()
 
 # Tự động gửi lời chào khi tạo bài viết mới
 @bot.event
@@ -87,7 +58,7 @@ async def on_thread_create(thread):
     except Exception as e:
         print(f"Lỗi gửi tin chào: {e}")
 
-# Tự động đọc và trả lời câu hỏi
+# Tự động đọc và trả lời câu hỏi (Cả Chữ & Hình Ảnh)
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -112,32 +83,67 @@ async def on_message(message):
             return
 
         prompt = message.content.replace(f"<@{bot.user.id}>", "").strip()
-        if not prompt:
+        
+        # Kiểm tra xem người dùng có đính kèm ảnh không
+        image_attachment = next(
+            (att for att in message.attachments if att.content_type and att.content_type.startswith("image/")), 
+            None
+        )
+
+        if not prompt and not image_attachment:
             return
 
         async with message.channel.typing():
             try:
-                selected_model = await get_best_model()
-                chat_completion = await groq_client.chat.completions.create(
-                    messages=[
+                # Xử lý khi có ảnh đính kèm
+                if image_attachment:
+                    if not prompt:
+                        prompt = "Hãy phân tích và đọc chi tiết nội dung trong hình ảnh này giúp tôi."
+
+                    # Tải ảnh và chuyển sang Base64
+                    image_bytes = await image_attachment.read()
+                    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+                    mime_type = image_attachment.content_type or "image/jpeg"
+
+                    messages_payload = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{mime_type};base64,{base64_image}"
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                    model_to_use = "llama-3.2-11b-vision-preview"
+                else:
+                    # Xử lý tin nhắn văn bản thông thường
+                    messages_payload = [
                         {
                             "role": "system",
                             "content": (
-                                "Bạn là một trợ lý AI thông minh, thân thiện. "
-                                "Hãy trả lời bằng tiếng Việt ngắn gọn, súc tích, tự nhiên và đi thẳng vào trọng tâm câu hỏi. "
-                                "Không trả lời dài dòng lan man."
+                                "Bạn là trợ lý AI thông minh, nhiệt tình. "
+                                "Hãy trả lời bằng tiếng Việt ngắn gọn, súc tích, tự nhiên và đúng trọng tâm."
                             )
                         },
                         {
                             "role": "user",
                             "content": prompt
                         }
-                    ],
-                    model=selected_model,
+                    ]
+                    model_to_use = "llama-3.1-8b-instant"
+
+                chat_completion = await groq_client.chat.completions.create(
+                    messages=messages_payload,
+                    model=model_to_use,
                 )
                 raw_answer = chat_completion.choices[0].message.content
 
-                # Lọc bỏ toàn bộ khối suy nghĩ <think>...</think> nếu có
+                # Lọc bỏ suy nghĩ nội bộ <think> nếu có
                 clean_answer = re.sub(r"<think>.*?</think>", "", raw_answer, flags=re.DOTALL).strip()
                 if not clean_answer:
                     clean_answer = raw_answer
@@ -149,7 +155,7 @@ async def on_message(message):
                         await message.channel.send(chunk)
 
             except Exception as e:
-                print(f"Lỗi Groq API: {e}")
+                print(f"Lỗi xử lý AI: {e}")
                 await message.reply(f"Lỗi phản hồi AI: {e}")
 
     await bot.process_commands(message)
