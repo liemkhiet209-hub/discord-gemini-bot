@@ -5,10 +5,9 @@ import discord
 from discord.ext import commands
 from google import genai
 
-# Lấy token từ biến môi trường
+# Lấy thông tin xác thực từ Environment Variables
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-TARGET_CHANNEL = "hỏi-đáp"
 
 # Web server mini giữ kết nối cho Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -28,47 +27,51 @@ def run_web():
 
 threading.Thread(target=run_web, daemon=True).start()
 
-# Cấu hình Discord & Gemini
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+# Cấu hình Intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"--> Bot đã online thành công: {bot.user}")
+    print(f"--> Bot đã online thành công với tên: {bot.user}")
 
-# Tự động gửi tin nhắn chào hỏi khi có bài đăng mới được tạo
+# Tự động chào khi có bài đăng / luồng mới được tạo
 @bot.event
 async def on_thread_create(thread):
-    # Kiểm tra xem bài đăng được tạo trong kênh/diễn đàn hỏi đáp hay không
-    parent = thread.parent
-    if parent and (parent.name == TARGET_CHANNEL or "hoi" in parent.name.lower() or "hỏi" in parent.name.lower()):
-        author = thread.owner.mention if thread.owner else "bạn"
-        await thread.send(f"Xin chào {author}! Bạn có cần giúp đỡ gì không? Hãy đặt câu hỏi chi tiết bên dưới nhé.")
+    try:
+        # Lấy ID của người tạo bài đăng
+        owner_id = thread.owner_id
+        mention_str = f"<@{owner_id}>" if owner_id else "bạn"
+        
+        await thread.send(f"Xin chào {mention_str}! Bạn có cần giúp đỡ gì không? Hãy nhập câu hỏi chi tiết bên dưới nhé!")
+        print(f"--> Đã gửi lời chào trong bài đăng: {thread.name}")
+    except Exception as e:
+        print(f"Lỗi khi gửi lời chào tạo bài đăng: {e}")
 
+# Tự động trả lời tin nhắn
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    # Kiểm tra tin nhắn trong kênh thường, bài đăng (thread) hoặc được tag tên
+    # Lấy tên kênh và tên kênh cha (nếu là bài đăng trong diễn đàn)
     channel_name = getattr(message.channel, "name", "").lower()
-    parent_name = getattr(getattr(message.channel, "parent", None), "name", "").lower()
+    parent_name = ""
+    if isinstance(message.channel, discord.Thread) and message.channel.parent:
+        parent_name = message.channel.parent.name.lower()
 
-    is_in_target = (
-        channel_name == TARGET_CHANNEL.lower()
-        or "hoi" in channel_name
-        or "hỏi" in channel_name
-        or parent_name == TARGET_CHANNEL.lower()
-        or "hoi" in parent_name
-        or "hỏi" in parent_name
-    )
+    # Kiểm tra điều kiện: tag bot, hoặc chat trong kênh/bài đăng hỏi đáp
     is_mentioned = bot.user in message.mentions
+    is_in_qa = (
+        "hoi" in channel_name or "hỏi" in channel_name or
+        "hoi" in parent_name or "hỏi" in parent_name
+    )
 
-    if is_in_target or is_mentioned:
+    if is_mentioned or is_in_qa:
         prompt = message.content.replace(f"<@{bot.user.id}>", "").strip()
 
         if not prompt:
@@ -87,14 +90,10 @@ async def on_message(message):
                 else:
                     for chunk in [answer[i:i+1900] for i in range(0, len(answer), 1900)]:
                         await message.channel.send(chunk)
-
             except Exception as e:
-                await message.reply(f"Đã xảy ra lỗi: {e}")
+                await message.reply(f"Đã xảy ra lỗi khi tạo phản hồi: {e}")
 
     await bot.process_commands(message)
 
 if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        print("LỖI: DISCORD_TOKEN chưa được cài đặt!")
-    else:
-        bot.run(DISCORD_TOKEN)
+    bot.run(DISCORD_TOKEN)
