@@ -5,12 +5,12 @@ import discord
 from discord.ext import commands
 from groq import AsyncGroq
 
-# Biến môi trường
+# Lấy biến môi trường
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TARGET_CHANNEL = "hỏi-đáp-gemini"
 
-# Web server mini duy trì kết nối cho Render
+# Web server mini duy trì trạng thái trên Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -40,9 +40,45 @@ groq_client = None
 if GROQ_API_KEY:
     groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
+# Tự động tìm mô hình chat khả dụng nhất trong tài khoản Groq
+cached_model = None
+
+async def get_best_model():
+    global cached_model
+    if cached_model:
+        return cached_model
+
+    try:
+        models_data = await groq_client.models.list()
+        # Lọc bỏ các model âm thanh hoặc kiểm duyệt
+        available_models = [
+            m.id for m in models_data.data 
+            if "whisper" not in m.id and "guard" not in m.id and "vision" not in m.id
+        ]
+        
+        # Ưu tiên các model chat phổ biến
+        for preference in ["llama-3.3", "llama-3.1", "llama3", "gemma2", "mixtral", "qwen"]:
+            for m in available_models:
+                if preference in m:
+                    cached_model = m
+                    print(f"--> Đã tự động kích hoạt model: {cached_model}")
+                    return cached_model
+                    
+        if available_models:
+            cached_model = available_models[0]
+            print(f"--> Sử dụng model mặc định: {cached_model}")
+            return cached_model
+    except Exception as e:
+        print(f"Lỗi khi lấy danh sách model: {e}")
+
+    return "llama-3.1-8b-instant"
+
 @bot.event
 async def on_ready():
     print(f"--> Bot đã online sẵn sàng: {bot.user}")
+    # Quét model ngay khi khởi động
+    if groq_client:
+        await get_best_model()
 
 # Tự động gửi tin nhắn chào khi tạo bài viết mới
 @bot.event
@@ -57,7 +93,7 @@ async def on_thread_create(thread):
     except Exception as e:
         print(f"Lỗi gửi tin chào: {e}")
 
-# Tự động đọc và phản hồi tin nhắn
+# Tự động đọc và trả lời câu hỏi
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -78,7 +114,7 @@ async def on_message(message):
 
     if is_in_target or is_mentioned:
         if not groq_client:
-            await message.reply("Lỗi: Chưa cấu hình GROQ_API_KEY trên máy chủ Render!")
+            await message.reply("Lỗi: Chưa cấu hình biến GROQ_API_KEY trên Render!")
             return
 
         prompt = message.content.replace(f"<@{bot.user.id}>", "").strip()
@@ -87,18 +123,19 @@ async def on_message(message):
 
         async with message.channel.typing():
             try:
+                selected_model = await get_best_model()
                 chat_completion = await groq_client.chat.completions.create(
                     messages=[
                         {
                             "role": "system",
-                            "content": "Bạn là một trợ lý AI thông minh, thân thiện và hữu ích. Hãy luôn trả lời tự nhiên bằng tiếng Việt."
+                            "content": "Bạn là trợ lý AI thông minh, hỗ trợ nhiệt tình và luôn trả lời tự nhiên, chính xác bằng tiếng Việt."
                         },
                         {
                             "role": "user",
                             "content": prompt
                         }
                     ],
-                    model="llama-3.1-8b-instant",
+                    model=selected_model,
                 )
                 answer = chat_completion.choices[0].message.content
 
