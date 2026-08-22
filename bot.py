@@ -24,7 +24,6 @@ OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 TARGET_CHANNEL = "hỏi-đáp-gemini"
 USER_COOLDOWN = 3
 
-# Bộ nhớ ngữ cảnh (lưu 8 tin nhắn gần nhất mỗi kênh/thread)
 conversation_history = defaultdict(list)
 user_last_time = defaultdict(float)
 
@@ -52,51 +51,78 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Danh sách CHỈ các model Groq chuẩn, miễn phí và hoạt động 100%
-STABLE_GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant"
-]
+# 4. Tự động lấy danh sách model ĐANG MỞ thực tế từ Groq
+async def get_live_groq_models(client: AsyncGroq) -> list:
+    try:
+        models_data = await client.models.list()
+        valid = [
+            m.id for m in models_data.data 
+            if "whisper" not in m.id.lower() 
+            and "guard" not in m.id.lower() 
+            and "orpheus" not in m.id.lower()
+            and "vision" not in m.id.lower()
+        ]
+        # Ưu tiên các model chất lượng cao nhất
+        valid.sort(key=lambda x: ("70b" in x or "3.3" in x or "3.1" in x), reverse=True)
+        return valid if valid else ["llama-3.3-70b-versatile"]
+    except Exception:
+        return ["llama-3.3-70b-versatile"]
 
-# 4. Xử lý câu hỏi văn bản qua Groq Pool
-async def ask_groq_text(channel_id: int, prompt: str) -> str:
-    if not GROQ_KEYS:
-        raise ValueError("Chưa cấu hình biến GROQ_API_KEY trên Render!")
-
+# 5. Xử lý câu hỏi văn bản qua Groq (dự phòng OpenRouter nếu Groq lỗi)
+async def ask_text_ai(channel_id: int, prompt: str) -> str:
     messages = [
-        {"role": "system", "content": "Bạn là trợ lý AI thông minh, nhiệt tình. Hãy trả lời ngắn gọn, tự nhiên, đúng trọng tâm bằng tiếng Việt."}
+        {"role": "system", "content": "Bạn là trợ lý AI thông minh, thân thiện. Hãy trả lời ngắn gọn, tự nhiên, đúng trọng tâm bằng tiếng Việt."}
     ]
     messages.extend(conversation_history[channel_id])
     messages.append({"role": "user", "content": prompt})
 
-    keys = GROQ_KEYS.copy()
-    random.shuffle(keys)
-    last_err = None
-
-    for key in keys:
-        client = AsyncGroq(api_key=key)
-        for model_name in STABLE_GROQ_MODELS:
+    # Thử gọi qua Groq
+    if GROQ_KEYS:
+        keys = GROQ_KEYS.copy()
+        random.shuffle(keys)
+        for key in keys:
             try:
-                chat_completion = await client.chat.completions.create(
-                    messages=messages,
-                    model=model_name,
-                )
-                raw = chat_completion.choices[0].message.content
-                answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip() or raw
+                client = AsyncGroq(api_key=key)
+                live_models = await get_live_groq_models(client)
+                for model_name in live_models:
+                    try:
+                        chat_completion = await client.chat.completions.create(
+                            messages=messages,
+                            model=model_name,
+                        )
+                        raw = chat_completion.choices[0].message.content
+                        answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip() or raw
 
+                        conversation_history[channel_id].append({"role": "user", "content": prompt})
+                        conversation_history[channel_id].append({"role": "assistant", "content": answer})
+                        if len(conversation_history[channel_id]) > 8:
+                            conversation_history[channel_id] = conversation_history[channel_id][-8:]
+                        return answer
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+    # Dự phòng sang OpenRouter nếu Groq gặp sự cố
+    if OPENROUTER_KEY:
+        try:
+            or_client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_KEY)
+            res = await or_client.chat.completions.create(
+                model="meta-llama/llama-3.3-70b-instruct:free",
+                messages=messages
+            )
+            if res.choices and res.choices[0].message.content:
+                answer = res.choices[0].message.content
                 conversation_history[channel_id].append({"role": "user", "content": prompt})
                 conversation_history[channel_id].append({"role": "assistant", "content": answer})
-                if len(conversation_history[channel_id]) > 8:
-                    conversation_history[channel_id] = conversation_history[channel_id][-8:]
-
                 return answer
-            except Exception as e:
-                last_err = e
-                continue
-    raise last_err
+        except Exception:
+            pass
 
-# 5. Xử lý đọc hình ảnh (Gemini -> OpenRouter dự phòng)
-async def ask_vision_multiprovider(channel_id: int, image_bytes: bytes, mime_type: str, prompt: str) -> str:
+    raise ValueError("Không thể kết nối đến hệ thống AI, vui lòng kiểm tra lại API Key!")
+
+# 6. Xử lý đọc hình ảnh (Gemini -> OpenRouter dự phòng)
+async def ask_vision_ai(channel_id: int, image_bytes: bytes, mime_type: str, prompt: str) -> str:
     text_prompt = prompt if prompt else "Hãy phân tích và đọc chi tiết nội dung trong hình ảnh này."
     pil_img = Image.open(io.BytesIO(image_bytes))
 
@@ -116,10 +142,10 @@ async def ask_vision_multiprovider(channel_id: int, image_bytes: bytes, mime_typ
                 if len(conversation_history[channel_id]) > 8:
                     conversation_history[channel_id] = conversation_history[channel_id][-8:]
                 return answer
-        except Exception as e:
+        except Exception:
             continue
 
-    # Dự phòng sang OpenRouter nếu Gemini hết lượt (429)
+    # Dự phòng sang OpenRouter Vision nếu Gemini hết lượt (429)
     if OPENROUTER_KEY:
         try:
             b64_img = base64.b64encode(image_bytes).decode("utf-8")
@@ -139,14 +165,14 @@ async def ask_vision_multiprovider(channel_id: int, image_bytes: bytes, mime_typ
                 conversation_history[channel_id].append({"role": "user", "content": f"[Ảnh]: {text_prompt}"})
                 conversation_history[channel_id].append({"role": "assistant", "content": answer})
                 return answer
-        except Exception as e:
+        except Exception:
             pass
 
     raise ValueError("Hệ thống đọc ảnh hiện đang quá tải lượt gọi, vui lòng thử lại sau!")
 
 @bot.event
 async def on_ready():
-    print(f"--> Bot đã sẵn sàng: {bot.user}")
+    print(f"--> Bot đã online sẵn sàng: {bot.user}")
 
 @bot.event
 async def on_thread_create(thread):
@@ -202,9 +228,9 @@ async def on_message(message):
                 if image_att:
                     img_bytes = await image_att.read()
                     mime_type = image_att.content_type or "image/jpeg"
-                    answer = await ask_vision_multiprovider(channel_id, img_bytes, mime_type, prompt)
+                    answer = await ask_vision_ai(channel_id, img_bytes, mime_type, prompt)
                 else:
-                    answer = await ask_groq_text(channel_id, prompt)
+                    answer = await ask_text_ai(channel_id, prompt)
 
                 if len(answer) <= 2000:
                     await message.reply(answer)
