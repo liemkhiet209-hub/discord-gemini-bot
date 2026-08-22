@@ -13,19 +13,18 @@ from groq import AsyncGroq
 from google import genai
 from PIL import Image
 
-# 1. Cấu hình biến môi trường (Hỗ trợ nhiều key cách nhau bằng dấu phẩy)
+# 1. Biến môi trường
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-
-GROQ_KEYS_RAW = os.environ.get("GROQ_API_KEY", "")
-GROQ_KEYS = [k.strip() for k in GROQ_KEYS_RAW.split(",") if k.strip()]
-
-GEMINI_KEYS_RAW = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_KEYS = [k.strip() for k in GEMINI_KEYS_RAW.split(",") if k.strip()]
-
+GROQ_KEYS = [k.strip() for k in os.environ.get("GROQ_API_KEY", "").split(",") if k.strip()]
+GEMINI_KEYS = [k.strip() for k in os.environ.get("GEMINI_API_KEY", "").split(",") if k.strip()]
 TARGET_CHANNEL = "hỏi-đáp-gemini"
-USER_COOLDOWN_SECONDS = 5  # Thời gian chờ giữa 2 lần hỏi của 1 người
+USER_COOLDOWN = 4
 
-# 2. Web server mini giữ bot luôn thức trên Render
+# Bộ nhớ lưu 8 tin nhắn gần nhất cho mỗi Thread/Channel
+conversation_history = defaultdict(list)
+user_last_time = defaultdict(float)
+
+# 2. Web server duy trì bot trên Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -42,20 +41,33 @@ def run_web():
 
 threading.Thread(target=run_web, daemon=True).start()
 
-# 3. Khởi tạo Discord Bot
+# 3. Khởi tạo bot Discord
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-user_last_message_time = defaultdict(float)
 
-# 4. Xử lý hỏi đáp Văn bản qua Groq Pool (Chịu tải 14.400 - 30.000 req/ngày)
-async def ask_groq_text(prompt: str) -> str:
+# 4. Hàm gọi Groq có kèm toàn bộ lịch sử trò chuyện
+async def ask_groq_text(channel_id: int, new_prompt: str) -> str:
     if not GROQ_KEYS:
         raise ValueError("Chưa cấu hình GROQ_API_KEY!")
 
-    # Xáo trộn danh sách key để chia đều tải
+    # Xây dựng danh sách tin nhắn gửi cho Groq (System + Lịch sử + Câu hỏi mới)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Bạn là trợ lý AI thông minh, thân thiện. "
+                "Hãy trả lời tự nhiên, chuẩn xác bằng tiếng Việt và theo sát ngữ cảnh của cuộc hội thoại."
+            )
+        }
+    ]
+    
+    # Kèm lịch sử các câu hỏi trước (bao gồm cả các câu Gemini đã trả lời)
+    messages.extend(conversation_history[channel_id])
+    messages.append({"role": "user", "content": new_prompt})
+
     shuffled_keys = GROQ_KEYS.copy()
     random.shuffle(shuffled_keys)
     last_err = None
@@ -64,24 +76,26 @@ async def ask_groq_text(prompt: str) -> str:
         try:
             client = AsyncGroq(api_key=key)
             chat_completion = await client.chat.completions.create(
-                messages=[
-                    {
-                        "role": "system", 
-                        "content": "Bạn là trợ lý AI thông minh, thân thiện. Hãy trả lời ngắn gọn, chuẩn xác, tự nhiên bằng tiếng Việt."
-                    },
-                    {"role": "user", "content": prompt}
-                ],
+                messages=messages,
                 model="llama-3.1-8b-instant",
             )
             raw = chat_completion.choices[0].message.content
-            return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip() or raw
+            answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip() or raw
+            
+            # Cập nhật câu hỏi và câu trả lời vào lịch sử
+            conversation_history[channel_id].append({"role": "user", "content": new_prompt})
+            conversation_history[channel_id].append({"role": "assistant", "content": answer})
+            if len(conversation_history[channel_id]) > 8:
+                conversation_history[channel_id] = conversation_history[channel_id][-8:]
+                
+            return answer
         except Exception as e:
             last_err = e
             continue
     raise last_err
 
-# 5. Xử lý đọc Hình ảnh qua Gemini 3.6 Pool (Tự động đổi Key khi hết lượt)
-async def ask_gemini_vision(pil_image, prompt: str) -> str:
+# 5. Hàm gọi Gemini Vision khi có ảnh
+async def ask_gemini_vision(channel_id: int, pil_image, prompt: str) -> str:
     if not GEMINI_KEYS:
         raise ValueError("Chưa cấu hình GEMINI_API_KEY!")
 
@@ -97,7 +111,15 @@ async def ask_gemini_vision(pil_image, prompt: str) -> str:
                 contents=[pil_image, text_prompt]
             )
             if res and res.text:
-                return res.text
+                answer = res.text
+                
+                # Lưu thông tin ảnh và câu trả lời của Gemini vào lịch sử để Groq đọc sau này
+                conversation_history[channel_id].append({"role": "user", "content": f"[Người dùng đã gửi một hình ảnh]: {text_prompt}"})
+                conversation_history[channel_id].append({"role": "assistant", "content": answer})
+                if len(conversation_history[channel_id]) > 8:
+                    conversation_history[channel_id] = conversation_history[channel_id][-8:]
+                    
+                return answer
         except Exception as e:
             last_err = e
             continue
@@ -105,7 +127,7 @@ async def ask_gemini_vision(pil_image, prompt: str) -> str:
 
 @bot.event
 async def on_ready():
-    print(f"--> Bot đã sẵn sàng phục vụ server đông người: {bot.user}")
+    print(f"--> Bot đã online với bộ nhớ đồng bộ: {bot.user}")
 
 @bot.event
 async def on_thread_create(thread):
@@ -137,13 +159,11 @@ async def on_message(message):
     is_mentioned = bot.user in message.mentions
 
     if is_in_target or is_mentioned:
-        # Kiểm tra cooldown chống spam từng cá nhân
         user_id = message.author.id
-        current_time = time.time()
-        elapsed = current_time - user_last_message_time[user_id]
-        if elapsed < USER_COOLDOWN_SECONDS:
-            remaining = int(USER_COOLDOWN_SECONDS - elapsed)
-            await message.reply(f"⏳ Vui lòng chờ `{remaining}s` trước khi gửi câu hỏi tiếp theo nhé!", delete_after=4)
+        now = time.time()
+        if now - user_last_time[user_id] < USER_COOLDOWN:
+            rem = int(USER_COOLDOWN - (now - user_last_time[user_id]))
+            await message.reply(f"⏳ Vui lòng chờ `{rem}s` trước khi gửi tiếp nhé!", delete_after=3)
             return
 
         prompt = message.content.replace(f"<@{bot.user.id}>", "").strip()
@@ -155,18 +175,19 @@ async def on_message(message):
         if not prompt and not image_att:
             return
 
-        user_last_message_time[user_id] = current_time
+        user_last_time[user_id] = now
+        channel_id = message.channel.id
 
         async with message.channel.typing():
             try:
                 if image_att:
-                    # Gửi qua luồng Vision (Gemini)
+                    # Gửi qua Gemini đọc ảnh và lưu vào memory
                     img_bytes = await image_att.read()
                     pil_img = Image.open(io.BytesIO(img_bytes))
-                    answer = await ask_gemini_vision(pil_img, prompt)
+                    answer = await ask_gemini_vision(channel_id, pil_img, prompt)
                 else:
-                    # Gửi qua luồng Text tốc độ cao (Groq)
-                    answer = await ask_groq_text(prompt)
+                    # Gửi qua Groq kèm toàn bộ memory của Gemini
+                    answer = await ask_groq_text(channel_id, prompt)
 
                 if len(answer) <= 2000:
                     await message.reply(answer)
@@ -175,8 +196,8 @@ async def on_message(message):
                         await message.channel.send(chunk)
 
             except Exception as e:
-                print(f"Lỗi xử lý AI: {e}")
-                await message.reply("⚠️ Hệ thống AI hiện đang xử lý quá tải, vui lòng thử lại sau giây lát!")
+                print(f"Lỗi phản hồi: {e}")
+                await message.reply("⚠️ Đã xảy ra lỗi khi xử lý, vui lòng thử lại sau giây lát!")
 
     await bot.process_commands(message)
 
