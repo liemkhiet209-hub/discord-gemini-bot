@@ -5,12 +5,12 @@ import discord
 from discord.ext import commands
 from groq import AsyncGroq
 
-# Lấy thông tin cấu hình từ biến môi trường
+# Biến môi trường
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TARGET_CHANNEL = "hỏi-đáp-gemini"
 
-# Web server mini giữ bot luôn thức trên Render
+# Web server mini duy trì kết nối cho Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -40,41 +40,11 @@ groq_client = None
 if GROQ_API_KEY:
     groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
-# Danh sách model miễn phí tốc độ cao trên Groq (tự động luân chuyển nếu gặp lỗi)
-GROQ_MODELS = [
-    "llama-3.1-8b-instant",
-    "gemma2-9b-it",
-    "llama3-8b-8192"
-]
-
-async def ask_groq_ai(prompt: str) -> str:
-    last_err = None
-    for model_name in GROQ_MODELS:
-        try:
-            chat_completion = await groq_client.chat.completions.create(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Bạn là trợ lý AI thông minh, nhiệt tình, luôn phản hồi bằng tiếng Việt tự nhiên, súc tích và chính xác."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                model=model_name,
-            )
-            return chat_completion.choices[0].message.content
-        except Exception as e:
-            last_err = e
-            continue
-    raise last_err
-
 @bot.event
 async def on_ready():
     print(f"--> Bot đã online sẵn sàng: {bot.user}")
 
-# Tự động gửi tin nhắn chào khi tạo bài viết / thread mới
+# Tự động gửi tin nhắn chào khi tạo bài viết mới
 @bot.event
 async def on_thread_create(thread):
     try:
@@ -85,15 +55,14 @@ async def on_thread_create(thread):
             await thread.send(f"Xin chào {mention_str}! Bạn có cần giúp đỡ gì không? Hãy đặt câu hỏi bên dưới nhé!")
             print(f"--> Đã gửi lời chào trong bài đăng: {thread.name}")
     except Exception as e:
-        print(f"Lỗi khi gửi lời chào: {e}")
+        print(f"Lỗi gửi tin chào: {e}")
 
-# Tự động đọc và trả lời câu hỏi
+# Tự động đọc và phản hồi tin nhắn
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
-    # Xác định kênh hiện tại hoặc kênh diễn đàn cha
     channel_name = getattr(message.channel, "name", "").lower()
     parent_name = ""
     if isinstance(message.channel, discord.Thread) and message.channel.parent:
@@ -109,7 +78,7 @@ async def on_message(message):
 
     if is_in_target or is_mentioned:
         if not groq_client:
-            await message.reply("Lỗi: Chưa cấu hình biến môi trường GROQ_API_KEY trên Render!")
+            await message.reply("Lỗi: Chưa cấu hình GROQ_API_KEY trên máy chủ Render!")
             return
 
         prompt = message.content.replace(f"<@{bot.user.id}>", "").strip()
@@ -118,14 +87,29 @@ async def on_message(message):
 
         async with message.channel.typing():
             try:
-                answer = await ask_groq_ai(prompt)
+                chat_completion = await groq_client.chat.completions.create(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Bạn là một trợ lý AI thông minh, thân thiện và hữu ích. Hãy luôn trả lời tự nhiên bằng tiếng Việt."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    model="llama-3.1-8b-instant",
+                )
+                answer = chat_completion.choices[0].message.content
 
                 if len(answer) <= 2000:
                     await message.reply(answer)
                 else:
                     for chunk in [answer[i:i+1900] for i in range(0, len(answer), 1900)]:
                         await message.channel.send(chunk)
+
             except Exception as e:
+                print(f"Lỗi Groq API: {e}")
                 await message.reply(f"Lỗi phản hồi AI: {e}")
 
     await bot.process_commands(message)
