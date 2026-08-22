@@ -11,16 +11,19 @@ import discord
 from discord.ext import commands
 from groq import AsyncGroq
 from google import genai
+from openai import AsyncOpenAI
 from PIL import Image
 
-# 1. Biến môi trường
+# 1. Cấu hình biến môi trường
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GROQ_KEYS = [k.strip() for k in os.environ.get("GROQ_API_KEY", "").split(",") if k.strip()]
 GEMINI_KEYS = [k.strip() for k in os.environ.get("GEMINI_API_KEY", "").split(",") if k.strip()]
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+
 TARGET_CHANNEL = "hỏi-đáp-gemini"
 USER_COOLDOWN = 3
 
-# Bộ nhớ ngữ cảnh (lưu 8 tin nhắn gần nhất mỗi kênh)
+# Bộ nhớ hội thoại (8 tin nhắn gần nhất mỗi kênh)
 conversation_history = defaultdict(list)
 user_last_time = defaultdict(float)
 
@@ -48,81 +51,107 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Danh sách model Groq hoạt động ổn định
-GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "gemma2-9b-it"
-]
+# 4. Tự động lấy danh sách Model Groq ĐANG HOẠT ĐỘNG
+async def get_working_groq_model(client: AsyncGroq) -> str:
+    try:
+        models = await client.models.list()
+        active_ids = [m.id for m in models.data if "whisper" not in m.id and "guard" not in m.id]
+        for pref in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
+            if pref in active_ids:
+                return pref
+        if active_ids:
+            return active_ids[0]
+    except Exception:
+        pass
+    return "llama-3.1-8b-instant"
 
-# 4. Xử lý câu hỏi chữ qua Groq (Kèm lịch sử)
-async def ask_groq_text(channel_id: int, new_prompt: str) -> str:
+# 5. Xử lý câu hỏi văn bản qua Groq Pool
+async def ask_groq_text(channel_id: int, prompt: str) -> str:
     if not GROQ_KEYS:
-        raise ValueError("Chưa cấu hình biến `GROQ_API_KEY` trên Render!")
+        raise ValueError("Chưa cấu hình biến GROQ_API_KEY trên Render!")
 
     messages = [
-        {
-            "role": "system",
-            "content": "Bạn là trợ lý AI thông minh, thân thiện. Hãy trả lời ngắn gọn, chuẩn xác, tự nhiên bằng tiếng Việt theo sát ngữ cảnh."
-        }
+        {"role": "system", "content": "Bạn là trợ lý AI thông minh, hỗ trợ nhiệt tình. Hãy trả lời ngắn gọn, tự nhiên, đúng trọng tâm bằng tiếng Việt."}
     ]
     messages.extend(conversation_history[channel_id])
-    messages.append({"role": "user", "content": new_prompt})
+    messages.append({"role": "user", "content": prompt})
 
-    shuffled_keys = GROQ_KEYS.copy()
-    random.shuffle(shuffled_keys)
+    keys = GROQ_KEYS.copy()
+    random.shuffle(keys)
     last_err = None
 
-    for key in shuffled_keys:
-        client = AsyncGroq(api_key=key)
-        for model_name in GROQ_MODELS:
-            try:
-                chat_completion = await client.chat.completions.create(
-                    messages=messages,
-                    model=model_name,
-                )
-                raw = chat_completion.choices[0].message.content
-                answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip() or raw
-                
-                # Lưu vào bộ nhớ ngữ cảnh
-                conversation_history[channel_id].append({"role": "user", "content": new_prompt})
-                conversation_history[channel_id].append({"role": "assistant", "content": answer})
-                if len(conversation_history[channel_id]) > 8:
-                    conversation_history[channel_id] = conversation_history[channel_id][-8:]
-                    
-                return answer
-            except Exception as e:
-                last_err = e
-                continue
+    for key in keys:
+        try:
+            client = AsyncGroq(api_key=key)
+            model_name = await get_working_groq_model(client)
+            chat_completion = await client.chat.completions.create(
+                messages=messages,
+                model=model_name,
+            )
+            raw = chat_completion.choices[0].message.content
+            answer = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip() or raw
+
+            conversation_history[channel_id].append({"role": "user", "content": prompt})
+            conversation_history[channel_id].append({"role": "assistant", "content": answer})
+            if len(conversation_history[channel_id]) > 8:
+                conversation_history[channel_id] = conversation_history[channel_id][-8:]
+
+            return answer
+        except Exception as e:
+            last_err = e
+            continue
     raise last_err
 
-# 5. Xử lý đọc hình ảnh qua Gemini (Lưu vào bộ nhớ chung)
-async def ask_gemini_vision(channel_id: int, pil_image, prompt: str) -> str:
-    if not GEMINI_KEYS:
-        raise ValueError("Chưa cấu hình biến `GEMINI_API_KEY` trên Render!")
-
+# 6. Xử lý đọc hình ảnh qua Gemini (Dự phòng sang OpenRouter nếu Gemini hết lượt 429)
+async def ask_vision_multiprovider(channel_id: int, image_bytes: bytes, mime_type: str, prompt: str) -> str:
     text_prompt = prompt if prompt else "Hãy phân tích và đọc chi tiết nội dung trong hình ảnh này."
-    last_err = None
+    pil_img = Image.open(io.BytesIO(image_bytes))
 
+    # Thử qua từng Key Gemini
     for key in GEMINI_KEYS:
         try:
             client = genai.Client(api_key=key)
             res = await asyncio.to_thread(
                 client.models.generate_content,
                 model="gemini-3.6-flash",
-                contents=[pil_image, text_prompt]
+                contents=[pil_img, text_prompt]
             )
             if res and res.text:
                 answer = res.text
-                conversation_history[channel_id].append({"role": "user", "content": f"[Ảnh đính kèm]: {text_prompt}"})
+                conversation_history[channel_id].append({"role": "user", "content": f"[Ảnh]: {text_prompt}"})
                 conversation_history[channel_id].append({"role": "assistant", "content": answer})
                 if len(conversation_history[channel_id]) > 8:
                     conversation_history[channel_id] = conversation_history[channel_id][-8:]
                 return answer
         except Exception as e:
-            last_err = e
+            print(f"Gemini Key lỗi/hết hạn mức: {e}")
             continue
-    raise last_err
+
+    # Nếu tất cả key Gemini đều hết lượt (429), chuyển sang OpenRouter Vision
+    if OPENROUTER_KEY:
+        try:
+            import base64
+            b64_img = base64.b64encode(image_bytes).decode("utf-8")
+            or_client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_KEY)
+            res = await or_client.chat.completions.create(
+                model="qwen/qwen-2.5-vl-72b-instruct:free",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": text_prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_img}"}}
+                    ]
+                }]
+            )
+            if res.choices and res.choices[0].message.content:
+                answer = res.choices[0].message.content
+                conversation_history[channel_id].append({"role": "user", "content": f"[Ảnh]: {text_prompt}"})
+                conversation_history[channel_id].append({"role": "assistant", "content": answer})
+                return answer
+        except Exception as e:
+            print(f"OpenRouter lỗi: {e}")
+
+    raise ValueError("Tất cả các API Key đọc ảnh đều đã hết lượt hôm nay!")
 
 @bot.event
 async def on_ready():
@@ -162,7 +191,7 @@ async def on_message(message):
         now = time.time()
         if now - user_last_time[user_id] < USER_COOLDOWN:
             rem = int(USER_COOLDOWN - (now - user_last_time[user_id]))
-            await message.reply(f"⏳ Vui lòng chờ `{rem}s` trước khi gửi tiếp nhé!", delete_after=3)
+            await message.reply(f"⏳ Vui lòng chờ `{rem}s` trước khi hỏi tiếp nhé!", delete_after=3)
             return
 
         prompt = message.content.replace(f"<@{bot.user.id}>", "").strip()
@@ -181,8 +210,8 @@ async def on_message(message):
             try:
                 if image_att:
                     img_bytes = await image_att.read()
-                    pil_img = Image.open(io.BytesIO(img_bytes))
-                    answer = await ask_gemini_vision(channel_id, pil_img, prompt)
+                    mime_type = image_att.content_type or "image/jpeg"
+                    answer = await ask_vision_multiprovider(channel_id, img_bytes, mime_type, prompt)
                 else:
                     answer = await ask_groq_text(channel_id, prompt)
 
@@ -193,8 +222,7 @@ async def on_message(message):
                         await message.channel.send(chunk)
 
             except Exception as e:
-                print(f"Chi tiết lỗi: {e}")
-                await message.reply(f"⚠️ **Lỗi chi tiết:** `{e}`")
+                await message.reply(f"⚠️ **Lỗi:** `{e}`")
 
     await bot.process_commands(message)
 
