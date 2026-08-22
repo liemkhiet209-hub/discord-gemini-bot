@@ -6,12 +6,12 @@ import discord
 from discord.ext import commands
 from google import genai
 
-# Lấy token từ biến môi trường
+# Cấu hình từ Environment Variables
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TARGET_CHANNEL = "hỏi-đáp-gemini"
 
-# Web server duy trì kết nối cho Render
+# Web server mini giữ kết nối cho Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -29,7 +29,7 @@ def run_web():
 
 threading.Thread(target=run_web, daemon=True).start()
 
-# Cấu hình Discord Client & Gemini Client
+# Cấu hình Discord & Gemini
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -37,29 +37,9 @@ intents.guilds = True
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Gọi AI theo cơ chế bất đồng bộ không làm lag bot
-async def get_gemini_response(prompt: str) -> str:
-    models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
-    
-    for model_name in models:
-        try:
-            # Chạy hàm gọi API ở luồng riêng để tránh khóa Event Loop
-            response = await asyncio.to_thread(
-                ai_client.models.generate_content,
-                model=model_name,
-                contents=prompt
-            )
-            if response and response.text:
-                return response.text
-        except Exception:
-            await asyncio.sleep(0.5)
-            continue
-
-    return "Hệ thống AI hiện đang bận phản hồi nhiều người cùng lúc. Bạn vui lòng gửi lại câu hỏi sau vài giây nhé!"
-
 @bot.event
 async def on_ready():
-    print(f"--> Bot đã online sẵn sàng: {bot.user}")
+    print(f"--> Bot đã online: {bot.user}")
 
 # Tự động gửi tin nhắn chào khi tạo bài viết mới
 @bot.event
@@ -73,7 +53,7 @@ async def on_thread_create(thread):
     except Exception as e:
         print(f"Lỗi khi gửi lời chào: {e}")
 
-# Tự động đọc và trả lời câu hỏi
+# Xử lý tin nhắn và gọi Gemini
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -99,13 +79,24 @@ async def on_message(message):
             return
 
         async with message.channel.typing():
-            answer = await get_gemini_response(prompt)
+            try:
+                # Gọi trực tiếp model 3.6-flash không qua vòng lặp chờ
+                response = await asyncio.to_thread(
+                    ai_client.models.generate_content,
+                    model="gemini-3.6-flash",
+                    contents=prompt
+                )
+                answer = response.text
 
-            if len(answer) <= 2000:
-                await message.reply(answer)
-            else:
-                for chunk in [answer[i:i+1900] for i in range(0, len(answer), 1900)]:
-                    await message.channel.send(chunk)
+                if len(answer) <= 2000:
+                    await message.reply(answer)
+                else:
+                    for chunk in [answer[i:i+1900] for i in range(0, len(answer), 1900)]:
+                        await message.channel.send(chunk)
+
+            except Exception as e:
+                print(f"Lỗi Gemini API: {e}")
+                await message.reply(f"Lỗi phản hồi từ AI: {e}")
 
     await bot.process_commands(message)
 
